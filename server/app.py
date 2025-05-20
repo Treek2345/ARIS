@@ -3,11 +3,20 @@ import os
 from dotenv import load_dotenv
 import asyncio
 import threading
-from flask import Flask, render_template, request # Make sure request is imported
+from flask import Flask, render_template, request, url_for # Make sure request and url_for are imported
 from flask_socketio import SocketIO, emit
+import json # For loading/saving token
+from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request as GoogleAuthRequest # Renamed to avoid conflict with Flask's request
+from google_auth_oauthlib.flow import Flow as GoogleAuthFlow 
 
 load_dotenv()
 from ARIS_Online import ARIS # Make sure filename matches ARIS_Online.py
+
+# Google OAuth Constants
+GOOGLE_CREDENTIALS_FILE = 'google_credentials.json' # Path to the downloaded OAuth client secret file
+GOOGLE_TOKEN_FILE = 'google_token.json' # Path to store the user's token
+GOOGLE_CALENDAR_SCOPES = ['https://www.googleapis.com/auth/calendar.readonly']
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.getenv('FLASK_SECRET_KEY', 'a_default_fallback_secret_key!')
@@ -194,10 +203,82 @@ def handle_video_feed_stopped():
     else:
         print(f"    ARIS instance not ready or SID mismatch for video_feed_stopped from {client_sid}.")
 
+@socketio.on('request_google_auth')
+def handle_request_google_auth():
+    client_sid = request.sid # This is SocketIO's request context
+    print(f"Client {client_sid} requested Google Authentication.")
+    if not os.path.exists(GOOGLE_CREDENTIALS_FILE):
+        emit('error', {'message': 'Google credentials file not found on server.'}, room=client_sid)
+        print("Error: google_credentials.json not found.")
+        return
+
+    try:
+        flow = GoogleAuthFlow.from_client_secrets_file(
+            GOOGLE_CREDENTIALS_FILE,
+            scopes=GOOGLE_CALENDAR_SCOPES,
+            redirect_uri=url_for('oauth2callback_google', _external=True) # This is Flask's url_for
+        )
+        authorization_url, state = flow.authorization_url(
+            access_type='offline', # Request refresh token
+            include_granted_scopes='true'
+        )
+        app.config['GOOGLE_AUTH_FLOW_STATE'] = state # Store state to validate in callback
+
+        print(f"Generated Google Auth URL: {authorization_url}")
+        emit('google_auth_url', {'url': authorization_url, 'state': state}, room=client_sid)
+        emit('status', {'message': 'Please visit the provided URL to authorize Google Calendar access.'}, room=client_sid)
+
+    except Exception as e:
+        print(f"Error creating Google Auth flow: {e}")
+        emit('error', {'message': f'Error starting Google Auth: {str(e)}'}, room=client_sid)
+
+@app.route('/oauth2callback-google') # This is a Flask route
+def oauth2callback_google():
+    # state = request.args.get('state') # State passed from Google, from Flask's request context
+    # stored_state = app.config.get('GOOGLE_AUTH_FLOW_STATE')
+
+    # if not state or state != stored_state:
+    #     return "State mismatch error. Please try authorizing again.", 400
+
+    if not os.path.exists(GOOGLE_CREDENTIALS_FILE):
+        return "Error: Server configuration issue (credentials file missing).", 500
+
+    try:
+        flow = GoogleAuthFlow.from_client_secrets_file(
+            GOOGLE_CREDENTIALS_FILE,
+            scopes=GOOGLE_CALENDAR_SCOPES,
+            redirect_uri=url_for('oauth2callback_google', _external=True) # Flask's url_for
+        )
+        
+        authorization_response = request.url # Flask's request context
+        flow.fetch_token(authorization_response=authorization_response)
+
+        credentials = flow.credentials 
+        
+        with open(GOOGLE_TOKEN_FILE, 'w') as token_file:
+            token_file.write(credentials.to_json())
+        
+        print("Google OAuth token fetched and saved successfully.")
+        
+        if ARIS_instance and ARIS_instance.client_sid:
+            socketio.emit('status', {'message': 'Google Calendar authorization successful!'}, room=ARIS_instance.client_sid)
+            socketio.emit('google_auth_success', {}, room=ARIS_instance.client_sid)
+        else: 
+            socketio.emit('status', {'message': 'Google Calendar authorization successful! You may need to reconnect or ask ARIS to check calendar.'})
+
+        return "Google Calendar authorization successful! You can close this tab and return to ARIS."
+
+    except Exception as e:
+        print(f"Error in Google OAuth callback: {e}")
+        if ARIS_instance and ARIS_instance.client_sid:
+             socketio.emit('error', {'message': f'Google Auth Error: {str(e)}'}, room=ARIS_instance.client_sid)
+        return f"Error during Google Calendar authorization: {str(e)}. Please try again.", 400
 
 if __name__ == '__main__':
     print("Starting Flask-SocketIO server...")
     try:
+        # Ensure Flask app context is available for url_for in handle_request_google_auth if it's called outside a Flask request
+        # However, socketio event handlers usually have app context.
         socketio.run(app, debug=True, host='0.0.0.0', port=5173, use_reloader=False)
     finally:
         print("\nServer shutting down...")

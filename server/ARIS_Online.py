@@ -8,16 +8,22 @@ from google.genai import types
 import asyncio
 from google import genai 
 import googlemaps
-from datetime import datetime 
+from datetime import datetime, timezone # Ensure timezone is imported
 import os
 from dotenv import load_dotenv
 import websockets
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
 import json
 from googlesearch import search as Google_Search_sync
 import aiohttp # For async HTTP requests
 from bs4 import BeautifulSoup # For HTML parsing
 
 load_dotenv()
+
+# Google Service Account Constants
+ARIS_SERVICE_ACCOUNT_FILE = 'aris_service_account.json' # Path to the service account key file
+GOOGLE_CALENDAR_SCOPES_SA = ['https://www.googleapis.com/auth/calendar.readonly'] # Scopes for service account
 
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
@@ -43,6 +49,8 @@ class ARIS:
         self.socketio = socketio_instance
         self.client_sid = client_sid
         self.Maps_api_key = MAPS_API_KEY
+        self.google_sa_creds = None # Initialize service account creds
+        self.google_sa_creds = self._load_service_account_creds() # Load them
 
         if torch.cuda.is_available():
             self.device = "cuda"
@@ -81,7 +89,19 @@ class ARIS:
                 },
                 required=["query"]
             )
-        )        
+        )
+        self.get_calendar_events_sa_func = types.FunctionDeclaration(
+            name="get_calendar_events_sa",
+            description="Fetches upcoming Google Calendar events using a service account. Requires the calendar to be shared with the service account's email. For example, to get events from the primary calendar, the user might need to share their primary calendar with the service account email address.",
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "calendar_id": types.Schema(type=types.Type.STRING, description="The ID of the calendar to fetch events from. This is often an email address (e.g., user@example.com for their primary) or 'primary' if the service account itself has a primary calendar (less common)."),
+                    "max_results": types.Schema(type=types.Type.INTEGER, description="Optional: The maximum number of events to return. Defaults to 10.")
+                },
+                required=["calendar_id"] # Make calendar_id required
+            )
+        )
         
         # --- End Function Declarations ---
 
@@ -89,7 +109,8 @@ class ARIS:
         self.available_functions = {
             "get_weather": self.get_weather,
             "get_travel_duration": self.get_travel_duration,
-            "get_search_results": self.get_search_results
+            "get_search_results": self.get_search_results,
+            "get_calendar_events_sa": self.get_calendar_events_sa # Add new function
         }
 
         # System behavior prompt (Keep as before)
@@ -108,7 +129,8 @@ class ARIS:
                 types.Tool(function_declarations=[
                     self.get_weather_func,
                     self.get_travel_duration_func,
-                    self.get_search_results_func
+                    self.get_search_results_func,
+                    self.get_calendar_events_sa_func # Add new function declaration
                 ])
             ]  # <--- End the list here
         )
@@ -619,3 +641,108 @@ class ARIS:
             finally: self.tts_websocket = None
         self.gemini_session = None
         print("ARIS tasks stopped.")
+
+    def _load_service_account_creds(self):
+        if not os.path.exists(ARIS_SERVICE_ACCOUNT_FILE):
+            print(f"ERROR: Service account file '{ARIS_SERVICE_ACCOUNT_FILE}' not found.")
+            if self.socketio and self.client_sid:
+                self.socketio.emit('error', {'message': f"Service account file '{ARIS_SERVICE_ACCOUNT_FILE}' not found on server. Please ensure it's set up correctly."}, room=self.client_sid)
+            return None
+        try:
+            creds = service_account.Credentials.from_service_account_file(
+                ARIS_SERVICE_ACCOUNT_FILE,
+                scopes=GOOGLE_CALENDAR_SCOPES_SA
+            )
+            print("Service account credentials loaded successfully.")
+            return creds
+        except Exception as e:
+            print(f"Error loading service account credentials: {e}")
+            if self.socketio and self.client_sid:
+                 self.socketio.emit('error', {'message': f"Error loading service account credentials: {str(e)}"}, room=self.client_sid)
+            return None
+
+    def _sync_get_calendar_events_sa(self, calendar_id='primary', max_results=10):
+        if not self.google_sa_creds:
+            print("Service account credentials not loaded. Cannot fetch calendar events.")
+            return {"error": "Service account credentials not loaded."}
+
+        try:
+            service = build('calendar', 'v3', credentials=self.google_sa_creds)
+            # Correctly use datetime.now with timezone.utc
+            now_utc_iso = datetime.now(timezone.utc).isoformat() 
+            
+            print(f"Fetching up to {max_results} upcoming events from calendar '{calendar_id}'")
+            events_result = service.events().list(
+                calendarId=calendar_id,
+                timeMin=now_utc_iso, 
+                maxResults=max_results,
+                singleEvents=True,
+                orderBy='startTime'
+            ).execute()
+            
+            events = events_result.get('items', [])
+            processed_events = []
+            if not events:
+                print(f"No upcoming events found for calendar '{calendar_id}'.")
+                return {"events": [], "message": f"No upcoming events found for calendar '{calendar_id}'."}
+
+            for event in events:
+                start = event['start'].get('dateTime', event['start'].get('date'))
+                end = event['end'].get('dateTime', event['end'].get('date'))
+                processed_events.append({
+                    'summary': event.get('summary', 'No Title'),
+                    'start': start,
+                    'end': end,
+                    'location': event.get('location'),
+                    'description': event.get('description')
+                })
+            print(f"Found {len(processed_events)} events for calendar '{calendar_id}'.")
+            return {"events": processed_events}
+
+        except Exception as e:
+            error_message = f"An error occurred fetching events for '{calendar_id}': {str(e)}"
+            print(error_message)
+            sa_email_info = "Unknown SA Email"
+            if self.google_sa_creds and hasattr(self.google_sa_creds, 'service_account_email'):
+                sa_email_info = self.google_sa_creds.service_account_email
+            
+            try:
+                from googleapiclient.errors import HttpError
+                if isinstance(e, HttpError):
+                    if e.resp.status == 404:
+                        error_message = f"Calendar with ID '{calendar_id}' not found. Ensure the ID is correct and the calendar exists."
+                    elif e.resp.status == 403:
+                         error_message = f"Access to calendar '{calendar_id}' denied. Ensure it's shared with the service account: {sa_email_info} and the Google Calendar API is enabled in your Google Cloud project."
+                    # You could add more specific checks here based on e.content if needed
+            except ImportError:
+                pass # HttpError not available, use generic error
+            except AttributeError: # If e.resp is not available
+                pass
+
+
+            return {"error": error_message}
+
+    async def get_calendar_events_sa(self, calendar_id='primary', max_results=10):
+        print(f"Async request to get calendar events for ID: {calendar_id}, max_results: {max_results}")
+        if not self.google_sa_creds:
+            print("Service account credentials not loaded. Attempting to load now...")
+            self.google_sa_creds = self._load_service_account_creds() 
+            if not self.google_sa_creds:
+                 print("Failed to load service account credentials on demand.")
+                 return {"error": "Service account credentials could not be loaded. Please ensure 'aris_service_account.json' is configured correctly."}
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError: 
+            print("No running event loop, creating a new one for this task.")
+            loop = asyncio.new_event_loop() 
+            asyncio.set_event_loop(loop)
+
+        result_dict = await loop.run_in_executor(
+            None,  # Uses default ThreadPoolExecutor
+            self._sync_get_calendar_events_sa,
+            calendar_id,
+            max_results
+        )
+       
+        return result_dict
