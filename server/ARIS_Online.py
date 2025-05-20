@@ -76,7 +76,8 @@ class ARIS:
             parameters=types.Schema(
                 type=types.Type.OBJECT,
                 properties={
-                    "query": types.Schema(type=types.Type.STRING, description="The search term or question to search Google for.")
+                    "query": types.Schema(type=types.Type.STRING, description="The search term or question to search Google for."),
+                    "num_results": types.Schema(type=types.Type.INTEGER, description="Optional: The maximum number of search results to return. Defaults to 5.")
                 },
                 required=["query"]
             )
@@ -284,11 +285,12 @@ class ARIS:
         # Return None if any exception occurred before successful extraction
         return None
     
-    def _sync_Google_Search(self, query: str, num_results: int = 5) -> list:
+    def _sync_Google_Search(self, query: str, num_results: int) -> list: # Changed signature
         # ... (keep the previous working version that returns URLs) ...
-        print(f"Performing synchronous Google search for: '{query}'")
+        print(f"Performing synchronous Google search for: '{query}', requesting {num_results} results.") # Log num_results
         try:
-            results = list(Google_Search_sync(term=query, num_results=num_results, lang="en", timeout=1))
+            # Use the num_results parameter in the call
+            results = list(Google_Search_sync(term=query, num_results=num_results, lang="en", timeout=1)) 
             print(f"Found {len(results)} results.")
             return results
         except Exception as e:
@@ -297,19 +299,25 @@ class ARIS:
 
 # Inside the ARIS class in server/ARIS_Online.py
 
-    async def get_search_results(self, query: str) -> dict:
+    async def get_search_results(self, query: str, num_results: int = 5) -> dict:
         """
         Async wrapper for Google search. Fetches URLs, then retrieves
         title, meta snippet, and a summary of page paragraph text for each.
         Emits results via SocketIO.
         Returns a dictionary containing a list of result objects.
         """
-        print(f"Received request for Google search with page content fetch: '{query}'")
+        print(f"Received request for Google search with page content fetch: '{query}', num_results: {num_results}")
+        
+        # Validate num_results
+        if not isinstance(num_results, int) or num_results < 1:
+            print(f"Invalid num_results value: {num_results}. Defaulting to 5.")
+            num_results = 5
+            
         fetched_results = [] # This will store dicts: {"url":..., "title":..., "meta_snippet":..., "page_content_summary":...}
         try:
-            # Step 1: Get URLs (no change)
+            # Step 1: Get URLs
             search_urls = await asyncio.to_thread(
-                self._sync_Google_Search, query, num_results=5
+                self._sync_Google_Search, query, num_results=num_results
             )
             if not search_urls:
                 print("No URLs found by Google Search.")
@@ -368,12 +376,12 @@ class ARIS:
                 try: q.get_nowait()
                 except asyncio.QueueEmpty: break
 
-    async def process_input(self, message, is_final_turn_input=False):
-        """ Puts message and flag into the input queue. """
-        print(f"Processing input: '{message}', Final Turn: {is_final_turn_input}")
+    async def process_input(self, message, is_final_turn_input=False, num_results=None): # Added num_results
+        """ Puts message, flag, and num_results into the input queue. """
+        print(f"Processing input: '{message}', Final Turn: {is_final_turn_input}, Num Results: {num_results}")
         if is_final_turn_input:
              await self.clear_queues() # Clear only before final input
-        await self.input_queue.put((message, is_final_turn_input))
+        await self.input_queue.put((message, is_final_turn_input, num_results)) # Store num_results
 
     async def process_video_frame(self, frame_data_url):
         """ Processes incoming video frame data URL """
@@ -385,16 +393,24 @@ class ARIS:
         print("Starting Gemini session manager...")
         try:
             while True: # Loop to process text inputs from the input_queue
-                message, is_final_turn_input = await self.input_queue.get()
+                message, is_final_turn_input, num_results = await self.input_queue.get() # Unpack num_results
 
                 if not (message.strip() and is_final_turn_input):
                     self.input_queue.task_done() # Mark non-final/empty messages as done
                     continue # Skip processing if not final input
 
-                print(f"Sending FINAL input to Gemini: {message}")
+                print(f"Sending FINAL input to Gemini: {message}, Num Results: {num_results}")
 
                 # --- Prepare Content for Gemini ---
-                request_content = [message]
+                request_content = []
+                if num_results is not None:
+                    # Add user-facing instruction about num_results
+                    instruction = f"User has specified they want {num_results} results for any search queries in this turn. Only use this information if performing a search."
+                    request_content.append(types.Part.from_text(instruction))
+                    print(f"Prepended instruction to Gemini: {instruction}")
+
+                request_content.append(types.Part.from_text(message)) # Add the actual message
+                
                 if self.latest_video_frame_data_url:
                     try:
                         header, encoded = self.latest_video_frame_data_url.split(",", 1)

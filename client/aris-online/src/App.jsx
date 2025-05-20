@@ -181,13 +181,14 @@ function App() {
     return float32Array;
   }
 
-  const handleSendText = (text) => {
+  const handleSendText = (text, numResults) => { // Accept numResults
     if (!text) return;
 
     setMessages(prev => [...prev, { sender: "user", text }]);
     
     if (socket.current?.connected) {
-      socket.current.emit("send_text_message", { message: text });
+      // Include num_results in the payload
+      socket.current.emit("send_text_message", { message: text, num_results: numResults }); 
       setVisualizerStatus(VISUALIZER_STATUS.PROCESSING);
     }
   };

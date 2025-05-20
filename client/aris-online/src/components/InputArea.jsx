@@ -25,6 +25,7 @@ function InputArea({
     onToggleWebcam   // **** RECEIVE WEBCAM HANDLER ****
 }) {
     const [inputValue, setInputValue] = useState('');
+    const [numReturnResults, setNumReturnResults] = useState(5); // Added state for number of results
 
     // Handle changes in the text input field
     const handleInputChange = (event) => {
@@ -35,8 +36,18 @@ function InputArea({
     const handleSend = () => {
         const trimmedInput = inputValue.trim();
         if (trimmedInput) {
-            onSendText(trimmedInput); // Call parent handler
+            onSendText(trimmedInput, numReturnResults); // Pass numReturnResults
             setInputValue(''); // Clear the input field
+        }
+    };
+
+    // Handle changes in the number input field
+    const handleNumResultsChange = (event) => {
+        const value = parseInt(event.target.value, 10);
+        if (value >= 1 && value <= 10) {
+            setNumReturnResults(value);
+        } else if (event.target.value === "") { // Allow clearing the input
+             setNumReturnResults(1); // Or some default like 1 if empty, or handle as error
         }
     };
 
@@ -81,6 +92,15 @@ function InputArea({
                 onChange={handleInputChange}
                 onKeyDown={handleKeyPress} // Use onKeyDown for better Enter key detection
                 aria-label="Message Input"
+            />
+            <input
+                type="number"
+                className="num-results-input"
+                value={numReturnResults}
+                onChange={handleNumResultsChange}
+                min="1"
+                max="10"
+                aria-label="Number of search results"
             />
             <button
                 className="send-button"

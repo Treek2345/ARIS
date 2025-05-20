@@ -132,11 +132,12 @@ def handle_text_message(data):
     """ Receives text message from client's input box """
     client_sid = request.sid
     message = data.get('message', '')
-    print(f"Received text from {client_sid}: {message}")
+    num_results = data.get('num_results') # Extract num_results
+    print(f"Received text from {client_sid}: {message}, num_results: {num_results}")
     if ARIS_instance and ARIS_instance.client_sid == client_sid:
         if ARIS_loop and ARIS_loop.is_running():
-            # Process text with end_of_turn=True implicitly handled in process_input -> run_gemini_session
-            asyncio.run_coroutine_threadsafe(ARIS_instance.process_input(message, is_final_turn_input=True), ARIS_loop)
+            # Process text with end_of_turn=True and pass num_results
+            asyncio.run_coroutine_threadsafe(ARIS_instance.process_input(message, is_final_turn_input=True, num_results=num_results), ARIS_loop)
             print(f"    Text message forwarded to ARIS for SID: {client_sid}")
         else:
             print(f"    Cannot process text message for SID {client_sid}: asyncio loop not ready.")
